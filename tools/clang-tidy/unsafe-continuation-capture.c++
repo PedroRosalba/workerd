@@ -162,79 +162,171 @@ static bool isSynchronousSink(
   return false;
 }
 
-// Given a `ReturnStmt`, decide whether the value being returned is
-// transitively `.wait()`-ed on by an enclosing synchronous-sink call.
+// ---- Result-owning-sink callee identification -----------------------------
 //
-// We answer "yes" when all of the following hold:
-//   1. The enclosing function of the return is the `operator()` of a
-//      lambda closure type;
-//   2. The `LambdaExpr` for that closure is (after the usual transparent
-//      wrappers) a direct argument of a `CallExpr`;
-//   3. The callee of that `CallExpr` is on `kBuiltinSynchronousSinks`.
+// Lambdas passed to one of these callees have their *return value* owned by
+// the promise (or container) that the call itself produces: the callee
+// either runs the lambda synchronously and wraps its result (`kj::evalNow`,
+// `KJ_MAP`), or adopts the promise the lambda returns into the chain it
+// returns (`kj::Promise::then`, `kj::evalLater`). A promise returned from
+// such a lambda therefore lives no longer than the call's result, and its
+// escape is decided by where that result goes.
 //
-// When all three hold, the return value's lifetime is bounded by the
-// enclosing sink call -- it cannot outlive the caller's activation --
-// so for escape-analysis purposes the return acts like `.wait()`.
-static bool isReturnFromSynchronousSinkLambda(
-    const ReturnStmt *rs, ASTContext &Ctx, const std::vector<std::string> &extraSyncSinks) {
-  if (!rs) return false;
-  // 1. Find the enclosing function declaration.
-  const FunctionDecl *enclosingFn = nullptr;
-  {
-    auto parents = Ctx.getParents(*rs);
-    while (!parents.empty()) {
-      if (const auto *fd = parents[0].get<FunctionDecl>()) {
-        enclosingFn = fd;
-        break;
+// Treated as suffix-qualified names (see `endsWithQualified`).
+static const llvm::StringRef kBuiltinResultOwningSinks[] = {
+  "kj::Promise::then",
+  "kj::Promise::catch_",
+  "kj::evalLater",
+  "kj::evalLast",
+  "kj::evalNow",
+  "kj::retryOnDisconnect",
+  // `KJ_MAP(x, container) { ... }` expands to `Mapper(container) * lambda`.
+  "kj::_::Mapper::operator*",
+};
+
+static bool isResultOwningSink(
+    llvm::StringRef qualifiedName, const std::vector<std::string> &extras) {
+  for (auto suffix: kBuiltinResultOwningSinks) {
+    if (endsWithQualified(qualifiedName, suffix)) return true;
+  }
+  for (const auto &extra: extras) {
+    if (endsWithQualified(qualifiedName, extra)) return true;
+  }
+  return false;
+}
+
+// Member functions of these classes take a promise argument and return a
+// promise that owns it, so the argument lives exactly as long as the result.
+static const llvm::StringRef kPromiseOwningMethods[] = {
+  "kj::Timer::timeoutAfter",
+  "kj::Timer::timeoutAt",
+  "kj::Canceler::wrap",
+  // Returns `canceler.wrap(promise)` or `promise` itself.
+  "WorkerEntrypoint::wrapWithCanceler",
+};
+
+static bool isPromiseOwningMethod(llvm::StringRef qualifiedName) {
+  for (auto suffix: kPromiseOwningMethods) {
+    if (endsWithQualified(qualifiedName, suffix)) return true;
+  }
+  return false;
+}
+
+// Qualified name of a function, with the template arguments of an enclosing
+// class-template specialization (or of a function-template specialization)
+// dropped, so that `kj::Promise<int>::then` compares equal to
+// `kj::Promise::then`.
+static std::string stripTemplateArgs(const NamedDecl *nd) {
+  if (!nd) return "";
+  if (const auto *md = dyn_cast<CXXMethodDecl>(nd)) {
+    if (const auto *spec = dyn_cast<ClassTemplateSpecializationDecl>(md->getParent())) {
+      if (const auto *td = spec->getSpecializedTemplate()) {
+        return td->getQualifiedNameAsString() + "::" + md->getNameAsString();
       }
-      if (const auto *st = parents[0].get<Stmt>()) {
-        parents = Ctx.getParents(*st);
-        continue;
-      }
-      if (const auto *dd = parents[0].get<Decl>()) {
-        parents = Ctx.getParents(*dd);
-        continue;
-      }
-      break;
     }
   }
-  if (!enclosingFn) return false;
-  // Must be the call operator of a lambda closure type.
-  const auto *md = dyn_cast<CXXMethodDecl>(enclosingFn);
-  if (!md) return false;
-  const auto *closure = md->getParent();
-  if (!closure || !closure->isLambda()) return false;
-  // 2. Walk up from the closure record decl to find the enclosing
-  // `LambdaExpr`, then up again to find the call it's an argument to.
-  const LambdaExpr *lambdaExpr = nullptr;
-  {
-    auto parents = Ctx.getParents(*closure);
-    int hops = 0;
-    while (!parents.empty() && hops++ < 8) {
-      if (const auto *le = parents[0].get<LambdaExpr>()) {
-        lambdaExpr = le;
-        break;
+  if (const auto *fd = dyn_cast<FunctionDecl>(nd)) {
+    if (fd->isFunctionTemplateSpecialization()) {
+      if (const auto *ftd = fd->getPrimaryTemplate()) {
+        return ftd->getQualifiedNameAsString();
       }
-      if (const auto *st = parents[0].get<Stmt>()) {
-        parents = Ctx.getParents(*st);
-        continue;
-      }
-      if (const auto *dd = parents[0].get<Decl>()) {
-        parents = Ctx.getParents(*dd);
-        continue;
-      }
-      break;
     }
   }
-  if (!lambdaExpr) return false;
-  // 3. Walk parents of the LambdaExpr through transparent wrappers
-  // until we find a CallExpr that takes the lambda as a direct argument.
+  return nd->getQualifiedNameAsString();
+}
+
+static std::string calleeQualifiedName(const CallExpr *ce) {
+  if (const auto *mce = dyn_cast<CXXMemberCallExpr>(ce)) {
+    if (const auto *md = mce->getMethodDecl()) return stripTemplateArgs(md);
+  }
+  if (const auto *fd = ce->getDirectCallee()) return stripTemplateArgs(fd);
+  return "";
+}
+
+// Returns true iff `fd` is the call operator of a lambda closure type.
+static bool isLambdaCallOperator(const FunctionDecl *fd) {
+  const auto *md = dyn_cast_or_null<CXXMethodDecl>(fd);
+  return md && md->getParent() && md->getParent()->isLambda();
+}
+
+// Locate the FunctionDecl that most closely encloses a statement.
+static const FunctionDecl *enclosingFunctionOfStmt(const Stmt *s, ASTContext &Ctx) {
+  auto parents = Ctx.getParents(*s);
+  while (!parents.empty()) {
+    if (const auto *fd = parents[0].get<FunctionDecl>()) return fd;
+    if (const auto *st = parents[0].get<Stmt>()) {
+      parents = Ctx.getParents(*st);
+      continue;
+    }
+    if (const auto *dd = parents[0].get<Decl>()) {
+      parents = Ctx.getParents(*dd);
+      continue;
+    }
+    break;
+  }
+  return nullptr;
+}
+
+// Given a lambda's call operator, return its `LambdaExpr`.
+static const LambdaExpr *lambdaExprOf(const CXXMethodDecl *callOperator, ASTContext &Ctx) {
+  auto parents = Ctx.getParents(*callOperator->getParent());
+  for (int hops = 0; !parents.empty() && hops < 8; ++hops) {
+    if (const auto *le = parents[0].get<LambdaExpr>()) return le;
+    if (const auto *st = parents[0].get<Stmt>()) {
+      parents = Ctx.getParents(*st);
+      continue;
+    }
+    if (const auto *dd = parents[0].get<Decl>()) {
+      parents = Ctx.getParents(*dd);
+      continue;
+    }
+    break;
+  }
+  return nullptr;
+}
+
+// The nearest enclosing function of `s` that is not a lambda call operator.
+static const FunctionDecl *enclosingNonLambdaFunction(const Stmt *s, ASTContext &Ctx) {
+  const FunctionDecl *fd = enclosingFunctionOfStmt(s, Ctx);
+  for (int hops = 0; fd && isLambdaCallOperator(fd) && hops < 16; ++hops) {
+    const LambdaExpr *le = lambdaExprOf(cast<CXXMethodDecl>(fd), Ctx);
+    fd = le ? enclosingFunctionOfStmt(le, Ctx) : nullptr;
+  }
+  return fd;
+}
+
+// Where a `return` statement sends its value.
+struct ReturnTarget {
+  // The return is from a lambda's call operator (rather than from a named
+  // function).
+  bool fromLambda = false;
+  // When `fromLambda`, the call that takes the lambda as a direct argument
+  // (looking through transparent wrappers), if there is one.
+  const CallExpr *lambdaSinkCall = nullptr;
+  // When `fromLambda`, the local variable the lambda initializes, if any.
+  const VarDecl *lambdaVar = nullptr;
+};
+
+static ReturnTarget returnTargetOf(const Stmt *rs, ASTContext &Ctx) {
+  ReturnTarget out;
+  const FunctionDecl *enclosingFn = enclosingFunctionOfStmt(rs, Ctx);
+  if (!enclosingFn || !isLambdaCallOperator(enclosingFn)) return out;
+  out.fromLambda = true;
+  const LambdaExpr *lambdaExpr = lambdaExprOf(cast<CXXMethodDecl>(enclosingFn), Ctx);
+  if (!lambdaExpr) return out;
+  // Walk parents of the LambdaExpr through transparent wrappers until we
+  // find a CallExpr that takes the lambda as a direct argument.
   const Stmt *current = lambdaExpr;
   for (int hops = 0; hops < 16; ++hops) {
     auto parents = Ctx.getParents(*current);
-    if (parents.empty()) return false;
+    if (parents.empty()) return out;
     const Stmt *parent = parents[0].get<Stmt>();
-    if (!parent) return false;
+    if (!parent) {
+      if (const auto *vd = parents[0].get<VarDecl>()) {
+        if (vd->hasLocalStorage() && !isa<ParmVarDecl>(vd)) out.lambdaVar = vd;
+      }
+      return out;
+    }
     if (isa<ParenExpr>(parent) || isa<ImplicitCastExpr>(parent) || isa<ExprWithCleanups>(parent) ||
         isa<MaterializeTemporaryExpr>(parent) || isa<CXXBindTemporaryExpr>(parent)) {
       current = parent;
@@ -245,35 +337,19 @@ static bool isReturnFromSynchronousSinkLambda(
         current = parent;
         continue;
       }
-      return false;
+      return out;
     }
     if (const auto *ce = dyn_cast<CallExpr>(parent)) {
-      std::string calleeName;
-      if (const auto *mce = dyn_cast<CXXMemberCallExpr>(ce)) {
-        if (const auto *cm = mce->getMethodDecl()) {
-          if (const auto *spec = dyn_cast<ClassTemplateSpecializationDecl>(cm->getParent())) {
-            if (const auto *td = spec->getSpecializedTemplate()) {
-              calleeName = td->getQualifiedNameAsString() + "::" + cm->getNameAsString();
-            }
-          }
-          if (calleeName.empty()) calleeName = cm->getQualifiedNameAsString();
+      for (const Expr *arg: ce->arguments()) {
+        if (arg == current) {
+          out.lambdaSinkCall = ce;
+          break;
         }
       }
-      if (calleeName.empty()) {
-        if (const auto *fd = ce->getDirectCallee()) {
-          if (fd->isFunctionTemplateSpecialization()) {
-            if (const auto *ftd = fd->getPrimaryTemplate())
-              calleeName = ftd->getQualifiedNameAsString();
-          }
-          if (calleeName.empty()) calleeName = fd->getQualifiedNameAsString();
-        }
-      }
-      if (calleeName.empty()) return false;
-      return isSynchronousSink(calleeName, extraSyncSinks);
     }
-    return false;
+    return out;
   }
-  return false;
+  return out;
 }
 
 // ---- Owning-wrapper identification -----------------------------------------
@@ -286,7 +362,10 @@ static const llvm::StringRef kOwningTemplates[] = {
   "kj::Own",
   "kj::Rc",
   "kj::Arc",
-  "kj::WeakRef",
+  "kj::Weak",
+  "kj::WeakRc",
+  "workerd::WeakRef",
+  "workerd::AtomicWeakRef",
   "workerd::jsg::Ref",
   "workerd::jsg::V8Ref",
   "workerd::jsg::JsRef",
@@ -571,7 +650,7 @@ static const char *safetyAdvice(CaptureSafety s) {
   switch (s) {
     case CaptureSafety::UnsafeBareReference:
       return "transfer ownership (kj::Own / kj::Rc / jsg::Ref) or capture a "
-             "kj::WeakRef / jsg::WeakRef";
+             "kj::Weak / kj::WeakRc / workerd::WeakRef / jsg::WeakRef";
     case CaptureSafety::UnsafeRawPointer:
       return "capture an owning smart pointer (kj::Own / kj::Rc) instead";
     case CaptureSafety::UnsafeNonOwningView:
@@ -579,7 +658,8 @@ static const char *safetyAdvice(CaptureSafety s) {
              "capturing, or capture the owning source";
     case CaptureSafety::UnsafeThis:
       return "use JSG_THIS (jsg::Ref<Self>) for JSG resource types, "
-             "kj::addRef(*this) for kj::Refcounted, or an IoOwn<Self>";
+             "kj::addRef(*this) for kj::Refcounted, an IoOwn<Self>, or a "
+             "weak handle (addWeakToThis() / Rc::downgrade())";
     case CaptureSafety::Safe:
       return "";
   }
@@ -726,7 +806,10 @@ static bool isContainerFinalizeMethod(llvm::StringRef name) {
 // of these (with the container as receiver) does not cause the container to
 // escape, so the use is local.
 static bool isContainerQueryMethod(llvm::StringRef name) {
-  return name == "empty" || name == "size" || name == "capacity";
+  // `onEmpty()` / `isEmpty()` are `kj::TaskSet` queries; the promise
+  // `onEmpty()` returns does not own the tasks.
+  return name == "empty" || name == "size" || name == "capacity" || name == "onEmpty" ||
+      name == "isEmpty";
 }
 
 // ---- Downstream `.attach(...)` lifetime binding ----------------------------
@@ -886,6 +969,13 @@ static BoundNames collectChainAttachBindings(const CallExpr *startCall, ASTConte
 // them go through `getOrBuildFunctionUseMap`, which has its own forward
 // declaration at file scope.)
 
+// The configured sink lists consulted by the escape analysis.
+struct SinkLists {
+  const std::vector<std::string> &async;
+  const std::vector<std::string> &sync;
+  const std::vector<std::string> &resultOwning;
+};
+
 enum class Escape {
   // The continuation is consumed in the current function activation.
   // Captures are safe.
@@ -899,22 +989,22 @@ enum class Escape {
   // other field destructor runs, so `[this]` is safe -- but other
   // captures still escape past the chain's invocation point.
   StoredAsSelfMember,
+  // The continuation is the return value of the nearest enclosing function
+  // that is not a lambda. It outlives the activation, but no longer than
+  // the promise that function returns, which its reference parameters
+  // outlive under the promise parameter contract.
+  Returned,
 };
 
 // Forward decl.
-static Escape classifyExprUse(const Expr *e,
-    ASTContext &Ctx,
-    int depth,
-    const std::vector<std::string> &extraSyncSinks,
-    const std::vector<std::string> &extraAsyncSinks);
+static Escape classifyExprUse(const Expr *e, ASTContext &Ctx, int depth, const SinkLists &sinks);
 
 // Forward decl.
 static Escape classifyVarDeclUses(const VarDecl *vd,
     const FunctionDecl *enclosingFn,
     ASTContext &Ctx,
     int depth,
-    const std::vector<std::string> &extraSyncSinks,
-    const std::vector<std::string> &extraAsyncSinks);
+    const SinkLists &sinks);
 
 // Locate the FunctionDecl enclosing a given Decl by walking parents.
 static const FunctionDecl *enclosingFunctionOf(const Decl *d, ASTContext &Ctx) {
@@ -973,8 +1063,7 @@ static Escape classifyVarDeclUses(const VarDecl *vd,
     const FunctionDecl *enclosingFn,
     ASTContext &Ctx,
     int depth,
-    const std::vector<std::string> &extraSyncSinks,
-    const std::vector<std::string> &extraAsyncSinks) {
+    const SinkLists &sinks) {
   static thread_local llvm::SmallPtrSet<const VarDecl *, 8> inProgress;
   if (!enclosingFn || !enclosingFn->getBody()) return Escape::Escapes;
   if (!inProgress.insert(vd).second) {
@@ -1001,25 +1090,68 @@ static Escape classifyVarDeclUses(const VarDecl *vd,
     return Escape::Local;  // dead store: no escape
   }
   bool sawStored = false;
+  bool sawReturned = false;
   for (const auto *use: it->second) {
-    Escape e = classifyExprUse(use, Ctx, depth + 1, extraSyncSinks, extraAsyncSinks);
+    Escape e = classifyExprUse(use, Ctx, depth + 1, sinks);
     if (e == Escape::Escapes) {
       return Escape::Escapes;
     }
     if (e == Escape::StoredAsSelfMember) sawStored = true;
+    if (e == Escape::Returned) sawReturned = true;
   }
-  return sawStored ? Escape::StoredAsSelfMember : Escape::Local;
+  // Each partial-escape kind only justifies its own captures, so a mix of
+  // them justifies none.
+  if (sawStored && sawReturned) return Escape::Escapes;
+  if (sawStored) return Escape::StoredAsSelfMember;
+  if (sawReturned) return Escape::Returned;
+  return Escape::Local;
+}
+
+// A chain returned from a local lambda (`auto retry = [&](...) { return
+// p.then(...); };`) goes wherever the lambda's call results go. Classify every
+// use of `lambdaVar`: each must be a direct call, whose result is then
+// classified like any other chain. Any other use (copying the lambda, passing
+// it somewhere) lets the chain escape.
+static Escape classifyLocalLambdaCalls(
+    const VarDecl *lambdaVar, ASTContext &Ctx, int depth, const SinkLists &sinks) {
+  const auto *fn = dyn_cast<FunctionDecl>(lambdaVar->getDeclContext());
+  for (int hops = 0; fn && isLambdaCallOperator(fn) && hops < 16; ++hops) {
+    fn = dyn_cast<FunctionDecl>(cast<CXXMethodDecl>(fn)->getParent()->getDeclContext());
+  }
+  if (!fn || !fn->getBody()) return Escape::Escapes;
+  const FunctionUseMap &useMap = getOrBuildFunctionUseMap(fn);
+  auto it = useMap.find(lambdaVar);
+  if (it == useMap.end()) return Escape::Local;
+  bool sawReturned = false;
+  for (const auto *use: it->second) {
+    const Stmt *callee = use;
+    auto parents = Ctx.getParents(*callee);
+    while (!parents.empty() && parents[0].get<ImplicitCastExpr>()) {
+      callee = parents[0].get<ImplicitCastExpr>();
+      parents = Ctx.getParents(*callee);
+    }
+    // A capture of the lambda by another lambda: that lambda's calls are
+    // separate uses, and the capture itself is checked as a capture.
+    if (!parents.empty() && parents[0].get<LambdaExpr>()) continue;
+    const auto *call = parents.empty() ? nullptr : parents[0].get<CXXOperatorCallExpr>();
+    if (!call || call->getOperator() != OO_Call || call->getArg(0) != callee) {
+      return Escape::Escapes;
+    }
+    Escape e = classifyExprUse(call, Ctx, depth + 1, sinks);
+    if (e == Escape::Returned) {
+      sawReturned = true;
+    } else if (e != Escape::Local) {
+      return Escape::Escapes;
+    }
+  }
+  return sawReturned ? Escape::Returned : Escape::Local;
 }
 
 // Walk parents of `e` to determine whether its value escapes the
 // current function activation. `depth` guards against pathological
 // recursion (cycles aren't possible in well-formed ASTs, but
 // instantiation can produce deep parent chains).
-static Escape classifyExprUse(const Expr *e,
-    ASTContext &Ctx,
-    int depth,
-    const std::vector<std::string> &extraSyncSinks,
-    const std::vector<std::string> &extraAsyncSinks) {
+static Escape classifyExprUse(const Expr *e, ASTContext &Ctx, int depth, const SinkLists &sinks) {
   if (depth > 32) return Escape::Escapes;
   if (!e) return Escape::Escapes;
 
@@ -1063,8 +1195,7 @@ static Escape classifyExprUse(const Expr *e,
             }
             break;
           }
-          return classifyVarDeclUses(
-              vd, enclosingFn, Ctx, depth + 1, extraSyncSinks, extraAsyncSinks);
+          return classifyVarDeclUses(vd, enclosingFn, Ctx, depth + 1, sinks);
         }
         // Non-local VarDecl (e.g. static/global/member). Escapes.
         return Escape::Escapes;
@@ -1168,16 +1299,49 @@ static Escape classifyExprUse(const Expr *e,
       return Escape::Escapes;
     }
 
-    // `return <expr>;` -- the continuation outlives the function.
-    // Exception: when the enclosing function is a lambda passed as a
-    // direct argument to a synchronous sink (see `kBuiltinSynchronousSinks`),
-    // the return value is `.wait()`-ed by the sink before its own
-    // activation ends, so the captures cannot dangle.
-    if (const auto *rs = dyn_cast<ReturnStmt>(parent)) {
-      if (isReturnFromSynchronousSinkLambda(rs, Ctx, extraSyncSinks)) return Escape::Local;
+    // Member access whose callee could not be resolved yet because the call
+    // is in a template (e.g. `promises.add(x)` inside a generic lambda, with
+    // a dependent `x`). Only the uninstantiated pattern is in the function's
+    // use map, so classify the use by the member name as above.
+    if (isa<UnresolvedMemberExpr>(parent) || isa<CXXDependentScopeMemberExpr>(parent)) {
+      std::string name;
+      if (const auto *ume = dyn_cast<UnresolvedMemberExpr>(parent)) {
+        name = ume->getMemberName().getAsString();
+      } else {
+        name = cast<CXXDependentScopeMemberExpr>(parent)->getMember().getAsString();
+      }
+      auto grandparents = Ctx.getParents(*parent);
+      const auto *call = grandparents.empty() ? nullptr : grandparents[0].get<CallExpr>();
+      if (!call || call->getCallee()->IgnoreImplicit() != parent) return Escape::Escapes;
+      if (isSynchronousConsumerMethod(name)) return Escape::Local;
+      if (isPromisePassThroughMethod(name) || isContainerFinalizeMethod(name)) {
+        current = call;
+        continue;
+      }
+      if (isContainerInsertMethod(name) || isContainerQueryMethod(name)) return Escape::Local;
       return Escape::Escapes;
     }
-    if (isa<CoreturnStmt>(parent)) return Escape::Escapes;
+
+    // `return <expr>;` / `co_return <expr>;` -- the continuation outlives
+    // the function. When that function is a lambda passed directly to a
+    // synchronous sink (see `kBuiltinSynchronousSinks`), the sink
+    // `.wait()`s on the return value before its own activation ends, so
+    // the captures cannot dangle. When it is passed to a result-owning sink
+    // (see `kBuiltinResultOwningSinks`), the sink call's result owns the
+    // return value, so classify that call's destination instead.
+    if (isa<ReturnStmt>(parent) || isa<CoreturnStmt>(parent)) {
+      ReturnTarget target = returnTargetOf(parent, Ctx);
+      if (!target.fromLambda) return Escape::Returned;
+      if (target.lambdaVar) return classifyLocalLambdaCalls(target.lambdaVar, Ctx, depth, sinks);
+      if (!target.lambdaSinkCall) return Escape::Escapes;
+      std::string sinkName = calleeQualifiedName(target.lambdaSinkCall);
+      if (isSynchronousSink(sinkName, sinks.sync)) return Escape::Local;
+      if (isResultOwningSink(sinkName, sinks.resultOwning)) {
+        current = target.lambdaSinkCall;
+        continue;
+      }
+      return Escape::Escapes;
+    }
 
     // `co_await <expr>` / `co_yield <expr>` -- consumed by the coroutine
     // suspension; the coroutine frame keeps the captures alive.
@@ -1221,8 +1385,7 @@ static Escape classifyExprUse(const Expr *e,
                 }
                 break;
               }
-              return classifyVarDeclUses(
-                  vd, enclosingFn, Ctx, depth + 1, extraSyncSinks, extraAsyncSinks);
+              return classifyVarDeclUses(vd, enclosingFn, Ctx, depth + 1, sinks);
             }
           }
         }
@@ -1292,8 +1455,8 @@ static Escape classifyExprUse(const Expr *e,
             if (const auto *dre = dyn_cast<DeclRefExpr>(peeled)) {
               if (const auto *vd = dyn_cast<VarDecl>(dre->getDecl())) {
                 if (vd->isLocalVarDecl()) {
-                  return classifyVarDeclUses(vd, enclosingFunctionOf(vd, Ctx), Ctx, depth + 1,
-                      extraSyncSinks, extraAsyncSinks);
+                  return classifyVarDeclUses(
+                      vd, enclosingFunctionOf(vd, Ctx), Ctx, depth + 1, sinks);
                 }
               }
             }
@@ -1328,7 +1491,7 @@ static Escape classifyExprUse(const Expr *e,
           }
         }
         if (qn.empty()) qn = md->getQualifiedNameAsString();
-        if (isAsyncSink(qn, extraAsyncSinks)) {
+        if (isAsyncSink(qn, sinks.async) || isPromiseOwningMethod(qn)) {
           current = mce;
           continue;
         }
@@ -1392,8 +1555,7 @@ static Escape classifyExprUse(const Expr *e,
                 }
                 break;
               }
-              return classifyVarDeclUses(
-                  vd, enclosingFn, Ctx, depth + 1, extraSyncSinks, extraAsyncSinks);
+              return classifyVarDeclUses(vd, enclosingFn, Ctx, depth + 1, sinks);
             }
             return Escape::Escapes;
           }
@@ -1438,8 +1600,7 @@ static Escape classifyExprUse(const Expr *e,
                 }
                 break;
               }
-              return classifyVarDeclUses(
-                  vd, enclosingFn, Ctx, depth + 1, extraSyncSinks, extraAsyncSinks);
+              return classifyVarDeclUses(vd, enclosingFn, Ctx, depth + 1, sinks);
             }
           }
         }
@@ -1483,11 +1644,183 @@ static Escape classifyExprUse(const Expr *e,
   }
 }
 
-static Escape promiseEscape(const CallExpr *Call,
-    ASTContext &Ctx,
-    const std::vector<std::string> &extraSyncSinks,
-    const std::vector<std::string> &extraAsyncSinks) {
-  return classifyExprUse(Call, Ctx, 0, extraSyncSinks, extraAsyncSinks);
+static Escape promiseEscape(const CallExpr *Call, ASTContext &Ctx, const SinkLists &sinks) {
+  return classifyExprUse(Call, Ctx, 0, sinks);
+}
+
+// ---- Referents with static storage duration --------------------------------
+//
+// A by-reference capture cannot dangle when its referent has static storage
+// duration. Lambdas never capture such variables themselves (they name them
+// directly), so the cases that reach the check are references bound to
+// them: a by-reference init-capture (`[&s = staticVar]`) or a reference
+// local (`auto& s = staticVar;`, or `auto& s = getStatic();` where the body
+// of `getStatic()` is visible and only returns static variables).
+
+static bool isStaticStorageVar(const VarDecl *vd) {
+  return vd && vd->getStorageDuration() == SD_Static && !vd->getType()->isReferenceType();
+}
+
+static bool referenceBoundToStaticStorage(const VarDecl *vd, int depth);
+
+// Collects the `return` statements of one function body, skipping nested
+// lambdas and local classes, whose returns belong to other functions.
+class ReturnCollector: public RecursiveASTVisitor<ReturnCollector> {
+ public:
+  llvm::SmallVector<const ReturnStmt *, 4> returns;
+  bool VisitReturnStmt(ReturnStmt *rs) {
+    returns.push_back(rs);
+    return true;
+  }
+  bool TraverseLambdaExpr(LambdaExpr *) {
+    return true;
+  }
+  bool TraverseCXXRecordDecl(CXXRecordDecl *) {
+    return true;
+  }
+};
+
+static bool exprRefersToStaticStorage(const Expr *e, int depth);
+
+// True iff `fd` returns a reference and every `return` in its body returns
+// a variable with static storage duration. Virtual functions are excluded
+// because the call may dispatch to a different body.
+static bool functionReturnsStaticStorage(const FunctionDecl *fd, int depth) {
+  if (!fd || !fd->getReturnType()->isReferenceType()) return false;
+  if (const auto *md = dyn_cast<CXXMethodDecl>(fd); md && md->isVirtual()) return false;
+  const FunctionDecl *def = nullptr;
+  if (!fd->hasBody(def) || !def || !def->getBody()) return false;
+  ReturnCollector collector;
+  collector.TraverseStmt(def->getBody());
+  if (collector.returns.empty()) return false;
+  for (const auto *rs: collector.returns) {
+    if (!exprRefersToStaticStorage(rs->getRetValue(), depth + 1)) return false;
+  }
+  return true;
+}
+
+static bool exprRefersToStaticStorage(const Expr *e, int depth) {
+  if (!e || depth > 4) return false;
+  e = e->IgnoreImplicit()->IgnoreParens();
+  if (const auto *dre = dyn_cast<DeclRefExpr>(e)) {
+    const auto *vd = dyn_cast<VarDecl>(dre->getDecl());
+    return isStaticStorageVar(vd) || referenceBoundToStaticStorage(vd, depth + 1);
+  }
+  if (const auto *ce = dyn_cast<CallExpr>(e)) {
+    return functionReturnsStaticStorage(ce->getDirectCallee(), depth + 1);
+  }
+  return false;
+}
+
+// True iff `vd` is a reference local or by-reference init-capture whose
+// initializer provably names a variable with static storage duration.
+static bool referenceBoundToStaticStorage(const VarDecl *vd, int depth) {
+  if (!vd || isa<ParmVarDecl>(vd) || !vd->hasLocalStorage()) return false;
+  if (!vd->getType()->isReferenceType()) return false;
+  return exprRefersToStaticStorage(vd->getInit(), depth);
+}
+
+// ---- Promise parameter contract ---------------------------------------------
+//
+// The KJ style guide (deps/capnproto/style-guide.md, "Ownership") makes this
+// the default for every function: a pointer or reference parameter must stay
+// valid until the function returns, or, when the function returns a promise,
+// until that promise completes or is canceled. So a continuation that is part
+// of the promise a function returns may capture that function's own
+// reference, pointer and view parameters. A caller that breaks the contract is
+// the bug, and this check cannot see callers.
+
+// True iff `fn` returns `kj::Promise<T>`.
+static bool returnsKjPromise(const FunctionDecl *fn) {
+  if (!fn) return false;
+  const auto *rd = fn->getReturnType().getCanonicalType()->getAsCXXRecordDecl();
+  return rd && rd->getQualifiedNameAsString() == "kj::Promise";
+}
+
+// True iff the capture refers to a parameter of `promiseFn` whose
+// referent the contract keeps alive: a reference parameter
+// (captured either way), or a view or pointer parameter captured by value.
+// A by-value parameter captured by reference refers to the function's own
+// stack slot, which dies when the function returns.
+static bool capturesContractParameter(const LambdaCapture &cap, const FunctionDecl *promiseFn) {
+  if (!promiseFn || !cap.capturesVariable()) return false;
+  const auto *pvd = dyn_cast_or_null<ParmVarDecl>(cap.getCapturedVar());
+  if (!pvd || pvd->getDeclContext() != promiseFn) return false;
+  return cap.getCaptureKind() != LCK_ByRef || pvd->getType()->isReferenceType();
+}
+
+// ---- Suspendable request contract ------------------------------------------
+//
+// `kj::HttpServer::SuspendableRequest` documents that its `url` and `headers`
+// stay valid until the HttpService the factory returns is destroyed (unless
+// the request is suspended, in which case the factory returns no service). So
+// a chain owned by that returned service may capture the request's `url` and
+// `headers`. "Owned by" is narrow: the chain is the direct argument of a
+// `kj::heap<T>(...)` call, T is a kj::HttpService, and that heap call's result
+// is what the enclosing function returns. Passing a promise by value to a
+// constructor transfers ownership of it to the constructed object.
+
+static bool derivesFrom(const CXXRecordDecl *rd, llvm::StringRef base, int depth = 0) {
+  if (!rd || !rd->hasDefinition() || depth > 16) return false;
+  if (rd->getQualifiedNameAsString() == base) return true;
+  for (const auto &b: rd->bases()) {
+    if (derivesFrom(b.getType()->getAsCXXRecordDecl(), base, depth + 1)) return true;
+  }
+  return false;
+}
+
+// The `kj::heap<T>(...)` call, with T a kj::HttpService, that takes the chain
+// `call` as a direct argument, if any.
+static const CallExpr *heapHttpServiceOwning(const CallExpr *call, ASTContext &Ctx) {
+  const Stmt *current = call;
+  for (int hops = 0; hops < 16; ++hops) {
+    auto parents = Ctx.getParents(*current);
+    if (parents.empty()) return nullptr;
+    const Stmt *parent = parents[0].get<Stmt>();
+    if (!parent) return nullptr;
+    if (isa<ImplicitCastExpr>(parent) || isa<MaterializeTemporaryExpr>(parent) ||
+        isa<CXXBindTemporaryExpr>(parent) || isa<ParenExpr>(parent) ||
+        (isa<CXXConstructExpr>(parent) && cast<CXXConstructExpr>(parent)->getNumArgs() == 1)) {
+      current = parent;
+      continue;
+    }
+    const auto *heapCall = dyn_cast<CallExpr>(parent);
+    if (!heapCall || calleeQualifiedName(heapCall) != "kj::heap") return nullptr;
+    const auto *own = heapCall->getType().getCanonicalType()->getAsCXXRecordDecl();
+    const auto *spec = dyn_cast_or_null<ClassTemplateSpecializationDecl>(own);
+    if (!spec || spec->getQualifiedNameAsString() != "kj::Own" ||
+        spec->getTemplateArgs().size() < 1) {
+      return nullptr;
+    }
+    const auto *target = spec->getTemplateArgs()[0].getAsType()->getAsCXXRecordDecl();
+    return derivesFrom(target, "kj::HttpService") ? heapCall : nullptr;
+  }
+  return nullptr;
+}
+
+// True iff the capture is `requestFn`'s `kj::HttpServer::SuspendableRequest&`
+// parameter, or a reference bound (by an init-capture or local reference) to
+// that parameter's `url` or `headers`.
+static bool capturesSuspendableRequest(const LambdaCapture &cap, const FunctionDecl *requestFn) {
+  if (!requestFn || !cap.capturesVariable()) return false;
+  const auto *vd = dyn_cast_or_null<VarDecl>(cap.getCapturedVar());
+  for (int hops = 0; vd && hops < 16; ++hops) {
+    if (const auto *pvd = dyn_cast<ParmVarDecl>(vd)) {
+      const auto *rd = pvd->getType().getNonReferenceType()->getAsCXXRecordDecl();
+      return pvd->getDeclContext() == requestFn && pvd->getType()->isReferenceType() && rd &&
+          rd->getQualifiedNameAsString() == "kj::HttpServer::SuspendableRequest";
+    }
+    if (!vd->getType()->isReferenceType() || !vd->getInit()) return false;
+    const Expr *init = vd->getInit()->IgnoreParenImpCasts();
+    if (const auto *me = dyn_cast<MemberExpr>(init)) {
+      auto name = me->getMemberDecl()->getName();
+      if (name != "url" && name != "headers") return false;
+      init = me->getBase()->IgnoreParenImpCasts();
+    }
+    const auto *dre = dyn_cast<DeclRefExpr>(init);
+    vd = dre ? dyn_cast<VarDecl>(dre->getDecl()) : nullptr;
+  }
+  return false;
 }
 
 }  // namespace
@@ -1514,7 +1847,8 @@ UnsafeContinuationCaptureCheck::UnsafeContinuationCaptureCheck(
     : ClangTidyCheck(Name, Context),
       AsyncSinksRaw(Options.get("AsyncSinks", "").str()),
       OwningCaptureTypesRaw(Options.get("OwningCaptureTypes", "").str()),
-      SynchronousSinksRaw(Options.get("SynchronousSinks", "").str()) {
+      SynchronousSinksRaw(Options.get("SynchronousSinks", "").str()),
+      ResultOwningSinksRaw(Options.get("ResultOwningSinks", "").str()) {
   auto split = [](llvm::StringRef in, std::vector<std::string> &out) {
     llvm::SmallVector<llvm::StringRef, 8> parts;
     in.split(parts, ',', -1, /*KeepEmpty=*/false);
@@ -1525,12 +1859,14 @@ UnsafeContinuationCaptureCheck::UnsafeContinuationCaptureCheck(
   split(AsyncSinksRaw, ExtraSinks);
   split(OwningCaptureTypesRaw, ExtraOwningTypes);
   split(SynchronousSinksRaw, ExtraSyncSinks);
+  split(ResultOwningSinksRaw, ExtraResultOwningSinks);
 }
 
 void UnsafeContinuationCaptureCheck::storeOptions(clang::tidy::ClangTidyOptions::OptionMap &Opts) {
   Options.store(Opts, "AsyncSinks", AsyncSinksRaw);
   Options.store(Opts, "OwningCaptureTypes", OwningCaptureTypesRaw);
   Options.store(Opts, "SynchronousSinks", SynchronousSinksRaw);
+  Options.store(Opts, "ResultOwningSinks", ResultOwningSinksRaw);
 }
 
 void UnsafeContinuationCaptureCheck::onEndOfTranslationUnit() {
@@ -1565,46 +1901,10 @@ void UnsafeContinuationCaptureCheck::check(const MatchFinder::MatchResult &Resul
   // already guarantees the lambda is a direct argument of this call;
   // no further argument-list scan is needed.
 
-  // Identify the callee. For CXXMemberCallExpr we want the method's
-  // qualified name; otherwise fall back to the called FunctionDecl.
-  //
-  // IMPORTANT: a member of a class-template specialization has a qualified
-  // name like `kj::Promise<int>::then`, with the template arguments baked
-  // in. That defeats our suffix-match against `kj::Promise::then`. So
-  // when the method's parent record is a template specialization, build
-  // the name from the *underlying* template's qualified name plus the
-  // method's bare name.
-  auto stripTemplateArgs = [](const NamedDecl *nd) -> std::string {
-    if (!nd) return "";
-    if (const auto *md = dyn_cast<CXXMethodDecl>(nd)) {
-      const auto *parent = md->getParent();
-      if (const auto *spec = dyn_cast<ClassTemplateSpecializationDecl>(parent)) {
-        if (const auto *td = spec->getSpecializedTemplate()) {
-          return td->getQualifiedNameAsString() + "::" + md->getNameAsString();
-        }
-      }
-    }
-    if (const auto *fd = dyn_cast<FunctionDecl>(nd)) {
-      if (fd->isFunctionTemplateSpecialization()) {
-        if (const auto *ftd = fd->getPrimaryTemplate()) {
-          return ftd->getQualifiedNameAsString();
-        }
-      }
-    }
-    return nd->getQualifiedNameAsString();
-  };
-
-  std::string calleeName;
-  if (const auto *mce = dyn_cast<CXXMemberCallExpr>(Call)) {
-    if (const auto *md = mce->getMethodDecl()) {
-      calleeName = stripTemplateArgs(md);
-    }
-  }
-  if (calleeName.empty()) {
-    if (const auto *fd = Call->getDirectCallee()) {
-      calleeName = stripTemplateArgs(fd);
-    }
-  }
+  // Identify the callee. A member of a class-template specialization has a
+  // qualified name like `kj::Promise<int>::then`; `calleeQualifiedName`
+  // drops the template arguments so it matches `kj::Promise::then`.
+  std::string calleeName = calleeQualifiedName(Call);
   if (calleeName.empty()) return;
 
   if (!isAsyncSink(calleeName, ExtraSinks)) return;
@@ -1613,9 +1913,28 @@ void UnsafeContinuationCaptureCheck::check(const MatchFinder::MatchResult &Resul
   // if the resulting promise is locally consumed (`.wait()`-ed,
   // `co_await`-ed, or used only by other locally-consumed promises), the
   // captures cannot outlive the current function activation. Suppress.
-  Escape escape = promiseEscape(Call, *Result.Context, ExtraSyncSinks, ExtraSinks);
+  SinkLists sinks{ExtraSinks, ExtraSyncSinks, ExtraResultOwningSinks};
+  Escape escape = promiseEscape(Call, *Result.Context, sinks);
   if (escape == Escape::Local) {
     return;
+  }
+
+  // Promise parameter contract: the chain is what the enclosing function
+  // returns as its promise, so that function's reference, pointer and view
+  // parameters outlive it.
+  const FunctionDecl *promiseFn = nullptr;
+  if (escape == Escape::Returned) {
+    const auto *fn = enclosingNonLambdaFunction(Call, *Result.Context);
+    if (returnsKjPromise(fn)) promiseFn = fn;
+  }
+
+  // Suspendable request contract: the chain is owned by the HttpService the
+  // enclosing function returns.
+  const FunctionDecl *requestFn = nullptr;
+  if (const CallExpr *heapCall = heapHttpServiceOwning(Call, *Result.Context)) {
+    if (classifyExprUse(heapCall, *Result.Context, 0, sinks) == Escape::Returned) {
+      requestFn = enclosingNonLambdaFunction(Call, *Result.Context);
+    }
   }
 
   // Collect bindings introduced by downstream `.attach(<owning-expr>...)`
@@ -1654,6 +1973,19 @@ void UnsafeContinuationCaptureCheck::check(const MatchFinder::MatchResult &Resul
 
     // Suppress: this capture is kept alive by a downstream `.attach()`.
     if (cap.capturesThis() && bound.boundThis) continue;
+
+    // Suppress: the referent has static storage duration.
+    if (safety == CaptureSafety::UnsafeBareReference && cap.capturesVariable() &&
+        referenceBoundToStaticStorage(dyn_cast_or_null<VarDecl>(cap.getCapturedVar()), 0)) {
+      continue;
+    }
+
+    // Suppress: the promise parameter contract keeps this parameter alive
+    // until the returned promise settles.
+    if (capturesContractParameter(cap, promiseFn)) continue;
+
+    // Suppress: the request's url and headers outlive the returned service.
+    if (capturesSuspendableRequest(cap, requestFn)) continue;
 
     // Suppress: the chain is stored as a member of the class whose `this`
     // was captured. The field's destructor will cancel the chain before
