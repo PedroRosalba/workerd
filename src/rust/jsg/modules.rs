@@ -9,6 +9,7 @@
 
 use std::pin::Pin;
 
+use crate::CallbackScope;
 use crate::Lock;
 use crate::UnitType;
 use crate::v8;
@@ -31,15 +32,20 @@ pub fn add_builtin<F>(
 {
     // Called only by the C++ module registry, while `isolate` is locked, a context is entered
     // and a `HandleScope` is open that outlives the call. It is not an `unsafe fn` because cxx
-    // passes function pointers as safe `fn`s, and no other code can name it.
-    fn trampoline<F>(isolate: *mut ffi::Isolate) -> ffi::Local
+    // passes function pointers as safe `fn`s, and no other code can name it. Returns an empty
+    // handle if `F` panicked, with the exception pending.
+    fn trampoline<F>(isolate: *mut ffi::Isolate) -> ffi::MaybeLocal
     where
         F: UnitType + for<'s> Fn(&mut Lock<'s>) -> v8::Local<'s, v8::Value>,
     {
         // SAFETY: see above.
-        crate::callback_scope!(unsafe let lock, isolate);
-        // SAFETY: the handle lives in the registry's HandleScope, which outlives this call.
-        unsafe { F::get()(lock).into_ffi() }
+        let scope = std::pin::pin!(unsafe { CallbackScope::new(isolate) });
+        crate::catch_panic(scope, |lock| {
+            let exports = v8::MaybeLocal::from(Some(F::get()(lock)));
+            // SAFETY: the handle lives in the registry's HandleScope, which outlives this call.
+            unsafe { exports.into_ffi() }
+        })
+        .unwrap_or_default()
     }
 
     let _ = callback;
