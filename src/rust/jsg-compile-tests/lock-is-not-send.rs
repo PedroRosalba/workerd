@@ -1,0 +1,14 @@
+// A lock stands for holding the isolate lock on this thread; it cannot move to another one.
+//
+// This compiles only if the type is not Send: were it Send, both impls would apply and the call
+// would be ambiguous. A plain `T: Send` bound would fail with one error per field that is not
+// Send, and how many of those rustc reports differs between versions.
+trait AmbiguousIfSend<A> {
+    fn some_item() {}
+}
+impl<T: ?Sized> AmbiguousIfSend<()> for T {}
+impl<T: ?Sized + Send> AmbiguousIfSend<u8> for T {}
+
+pub fn t() {
+    let _ = <jsg::Lock<'static> as AmbiguousIfSend<_>>::some_item;
+}
