@@ -175,12 +175,12 @@ pub fn jsg_method(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let fn_block = &input_fn.block;
     let callback_name = syn::Ident::new(&format!("{fn_name}_callback"), fn_name.span());
 
-    // Methods with a receiver (&self, &mut self) become instance methods on the prototype.
+    // Methods with a `&self` receiver become instance methods on the prototype.
     // Methods without a receiver become static methods on the constructor.
-    let has_self = fn_sig
-        .inputs
-        .iter()
-        .any(|arg| matches!(arg, FnArg::Receiver(_)));
+    if let Some(error) = receiver_error(&input_fn, &callback_name) {
+        return error.into();
+    }
+    let has_self = fn_sig.receiver().is_some();
 
     let params: Vec<_> = fn_sig
         .inputs
@@ -268,11 +268,10 @@ pub fn jsg_method(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 lock.throw_exception(&jsg::Error::new_type_error("Illegal invocation"));
                 return;
             };
-            // SAFETY: `resource` points at a live `Self` owned by the V8-wrapped
-            // resource whose method is being invoked; the `&mut` is sound because
-            // V8 is single-threaded and no other Rust code can alias the resource
-            // during the callback.
-            let self_: &mut Self = unsafe { &mut *resource.as_ptr() };
+            // SAFETY: `resource` points at the `Self` of `this`, whose wrapper keeps it alive
+            // during the call. Resources are only ever borrowed shared, so this may alias the
+            // borrow of a method that called into JavaScript, or of GC tracing.
+            let self_: &Self = unsafe { resource.as_ref() };
             let result = self_.#fn_name(#(#arg_exprs),*);
         }
     } else {
@@ -303,6 +302,32 @@ pub fn jsg_method(_attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     }
     .into()
+}
+
+/// Rejects a method receiver other than `&self`. JavaScript can call back into the resource, and
+/// GC can trace it, while a method runs, so a method never has exclusive access to its resource.
+fn receiver_error(
+    input_fn: &ItemFn,
+    callback_name: &syn::Ident,
+) -> Option<proc_macro2::TokenStream> {
+    let receiver = input_fn.sig.receiver()?;
+    if matches!(&*receiver.ty, syn::Type::Reference(r) if r.mutability.is_none()) {
+        return None;
+    }
+    let error = syn::Error::new_spanned(
+        receiver,
+        "a resource method takes `&self`: JavaScript can call into the resource while the \
+         method runs, so the method cannot have exclusive access. Keep state that methods \
+         change in `Cell` or `RefCell` fields",
+    )
+    .to_compile_error();
+    // The method and its callback are still emitted, so that the registration in
+    // `#[jsg_resource]` adds no errors of its own.
+    Some(quote! {
+        #error
+        #input_fn
+        fn #callback_name() -> jsg::RawFunctionCallback { unreachable!() }
+    })
 }
 
 // =============================================================================
