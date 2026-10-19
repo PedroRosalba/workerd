@@ -263,7 +263,8 @@ void wrappable_clear_trait_object(Wrappable& wrappable);
 kj::uint wrappable_strong_refcount(const Wrappable& wrappable);
 
 // Wrappers
-Local wrap_resource(Isolate* isolate, kj::Rc<Wrappable> wrappable, const Global& tmpl);
+// Returns an empty handle if the Wrappable has a live wrapper in another isolate.
+MaybeLocal wrap_resource(Isolate* isolate, kj::Rc<Wrappable> wrappable, const Global& tmpl);
 void wrappable_attach_wrapper(kj::Rc<Wrappable> wrappable, FunctionCallbackInfo& args);
 
 // Unwrappers
