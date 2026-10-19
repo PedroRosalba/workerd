@@ -63,7 +63,7 @@ pub mod ffi {
     /// Mirrors `v8::MaybeLocal<T>`: a single pointer-sized word where `ptr == 0` means empty.
     /// This matches V8's internal layout exactly — `v8::MaybeLocal<T>` holds one `Local<T>`
     /// field which is itself one `internal::Address*` (one pointer word).
-    #[derive(Debug, Clone, Copy)]
+    #[derive(Debug, Clone, Copy, Default)]
     struct MaybeLocal {
         ptr: usize,
     }
@@ -690,7 +690,7 @@ pub mod ffi {
         pub unsafe fn register_add_builtin_module(
             registry: Pin<&mut ModuleRegistry>,
             specifier: &str,
-            callback: unsafe fn(*mut Isolate) -> Local,
+            callback: unsafe fn(*mut Isolate) -> MaybeLocal,
             module_type: ModuleType,
         );
     }
@@ -2424,6 +2424,15 @@ impl<'s, T> MaybeLocal<'s, T> {
             handle,
             _marker: PhantomData,
         }
+    }
+
+    /// Returns the underlying FFI handle.
+    ///
+    /// # Safety
+    /// The returned FFI handle carries no lifetime; it must not be used after the
+    /// `HandleScope` that owns the V8 value is closed.
+    pub unsafe fn into_ffi(self) -> ffi::MaybeLocal {
+        self.handle
     }
 
     /// Returns `true` if this `MaybeLocal` is empty.
