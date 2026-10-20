@@ -1046,9 +1046,13 @@ jsg::Ref<Response> Response::constructor(jsg::Lock& js,
 
       statusCode = otherResponse->statusCode;
       bodyEncoding = otherResponse->bodyEncoding;
-      kj::StringPtr otherStatusText = otherResponse->getStatusText();
-      if (otherStatusText != defaultStatusText(statusCode)) {
-        statusText = kj::str(otherStatusText);
+      if (FeatureFlags::get(js).getPedanticWpt()) {
+        statusText = otherResponse->statusText.clone();
+      } else {
+        kj::StringPtr otherStatusText = otherResponse->getStatusText(js);
+        if (otherStatusText != defaultStatusText(statusCode)) {
+          statusText = kj::str(otherStatusText);
+        }
       }
       headers = js.alloc<Headers>(js, *otherResponse->headers);
       cf = otherResponse->cf.deepClone(js);
@@ -1184,12 +1188,19 @@ jsg::Ref<Response> Response::json_(
         }
       }
       KJ_CASE_ONEOF(res, jsg::Ref<Response>) {
-        auto otherStatusText = res->getStatusText();
+        jsg::Optional<kj::String> statusText;
+        if (FeatureFlags::get(js).getPedanticWpt()) {
+          statusText = res->statusText.clone();
+        } else {
+          auto otherStatusText = res->getStatusText(js);
+          if (otherStatusText != nullptr &&
+              otherStatusText != defaultStatusText(res->statusCode)) {
+            statusText = kj::str(otherStatusText);
+          }
+        }
         auto newInit = InitializerDict{
           .status = res->statusCode,
-          .statusText = otherStatusText == nullptr ||
-                        otherStatusText == defaultStatusText(res->statusCode)
-                        ? jsg::Optional<kj::String>() : kj::str(otherStatusText),
+          .statusText = kj::mv(statusText),
           .headers = maybeSetContentType(js, Headers::constructor(js, res->headers.addRef())),
           .cf = res->cf.getRef(js),
           .encodeBody =
@@ -1301,14 +1312,14 @@ kj::Promise<DeferredProxy<void>> Response::send(jsg::Lock& js,
   } else KJ_IF_SOME(jsBody, getBody(js)) {
     auto encoding = getContentEncoding(context, outHeaders, bodyEncoding, FeatureFlags::get(js));
     auto maybeLength = jsBody.tryGetLength(js, encoding);
-    auto stream =
-        newSystemStream(outer.send(statusCode, getStatusText(), outHeaders, maybeLength), encoding);
+    auto stream = newSystemStream(
+        outer.send(statusCode, getReasonPhrase(), outHeaders, maybeLength), encoding);
     // We need to enter the AsyncContextFrame that was captured when the
     // Response was created before starting the loop.
     jsg::AsyncContextFrame::Scope scope(js, asyncContext);
     return jsBody.pumpTo(js, kj::mv(stream), EndStream::YES);
   } else {
-    outer.send(statusCode, getStatusText(), outHeaders, static_cast<uint64_t>(0));
+    outer.send(statusCode, getReasonPhrase(), outHeaders, static_cast<uint64_t>(0));
     return addNoopDeferredProxy(kj::READY_NOW);
   }
 }
@@ -1316,7 +1327,18 @@ kj::Promise<DeferredProxy<void>> Response::send(jsg::Lock& js,
 int Response::getStatus() {
   return statusCode;
 }
-kj::StringPtr Response::getStatusText() {
+kj::StringPtr Response::getStatusText(jsg::Lock& js) {
+  KJ_IF_SOME(text, statusText) {
+    return text;
+  }
+  // The Fetch spec leaves the status message empty unless something sets it. Without
+  // pedantic_wpt, we instead derive one from the status code for backwards compatibility.
+  if (FeatureFlags::get(js).getPedanticWpt()) {
+    return ""_kj;
+  }
+  return defaultStatusText(statusCode);
+}
+kj::StringPtr Response::getReasonPhrase() {
   KJ_IF_SOME(text, statusText) {
     return text;
   }
@@ -2222,7 +2244,11 @@ jsg::Ref<Response> makeHttpResponse(jsg::Lock& js,
   }
 
   // TODO(someday): Fill response CF blob from somewhere?
-  kj::Maybe<kj::String> maybeStatusText = statusText == defaultStatusText(statusCode)
+  // A network response's status message is the reason phrase the server sent. Without
+  // pedantic_wpt, getStatusText() derives the same phrase when it matches the status code's
+  // default, so it need not be stored.
+  kj::Maybe<kj::String> maybeStatusText =
+      !FeatureFlags::get(js).getPedanticWpt() && statusText == defaultStatusText(statusCode)
       ? kj::Maybe<kj::String>()
       : kj::str(statusText);
   return js.alloc<Response>(js, statusCode, kj::mv(maybeStatusText), kj::mv(responseHeaders),
@@ -2295,6 +2321,7 @@ jsg::Promise<jsg::Ref<Response>> fetchImplNoOutputLock(jsg::Lock& js,
       return js.resolvedPromise(Response::constructor(js, kj::mv(maybeResponseBody),
           Response::InitializerDict{
             .status = 200,
+            .statusText = kj::str("OK"),
             .headers = kj::mv(headers),
           }));
     }
@@ -2640,7 +2667,7 @@ static jsg::Promise<void> throwOnError(
     //   should people really use fetch() if they want to inspect error responses?
     JSG_REQUIRE(status >= 200 && status < 300, Error,
         kj::str("HTTP ", method, " request failed: ", response->getStatus(), " ",
-            response->getStatusText()));
+            response->getReasonPhrase()));
   });
 }
 
@@ -2695,8 +2722,8 @@ jsg::Promise<Fetcher::GetResult> Fetcher::get(
       // TODO(someday): Would be nice to attach the response to the JavaScript error, maybe? Or
       //   should people really use fetch() if they want to inspect error responses?
       JSG_FAIL_REQUIRE(Error,
-          kj::str(
-              "HTTP GET request failed: ", response->getStatus(), " ", response->getStatusText()));
+          kj::str("HTTP GET request failed: ", response->getStatus(), " ",
+              response->getReasonPhrase()));
     } else {
       return parseResponse(js, kj::mv(response), kj::mv(type));
     }
