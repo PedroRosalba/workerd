@@ -626,6 +626,24 @@ CryptoKeyUsageSet CryptoKey::getUsageSet() const {
   return impl->getUsages();
 }
 
+jsg::MemoizedIdentity<CryptoKey::AlgorithmVariant>& CryptoKey::getAlgorithmProperty(jsg::Lock& js) {
+  if (FeatureFlags::get(js).getPedanticWpt()) {
+    KJ_IF_SOME(cached, algorithmProperty) {
+      return cached;
+    }
+  }
+  return algorithmProperty.emplace(getAlgorithm(js));
+}
+
+jsg::MemoizedIdentity<kj::Array<kj::StringPtr>>& CryptoKey::getUsagesProperty(jsg::Lock& js) {
+  if (FeatureFlags::get(js).getPedanticWpt()) {
+    KJ_IF_SOME(cached, usagesProperty) {
+      return cached;
+    }
+  }
+  return usagesProperty.emplace(getUsages());
+}
+
 bool CryptoKey::operator==(const CryptoKey& other) const {
   // We check this first because we don't want any comparison to happen if
   // either key is not extractable, even if they are the same object.
@@ -650,6 +668,7 @@ bool CryptoKey::verifyX509Private(const X509* cert) const {
 }
 
 void CryptoKey::visitForGc(jsg::GcVisitor& visitor) {
+  visitor.visit(algorithmProperty, usagesProperty);
   if (impl.get() == nullptr) return;
   impl->visitForGc(visitor);
 }

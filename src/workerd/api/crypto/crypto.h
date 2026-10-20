@@ -302,11 +302,18 @@ class CryptoKey: public jsg::Object {
   kj::Array<kj::StringPtr> getUsages() const;
   CryptoKeyUsageSet getUsageSet() const;
 
+  // Getters for the `algorithm` and `usages` properties. With the pedantic_wpt compatibility flag,
+  // these return the same JavaScript object on every access, which the spec calls
+  // [[algorithm_cached]] and [[usages_cached]]. C++ callers should use getAlgorithm() and
+  // getUsages() instead.
+  jsg::MemoizedIdentity<AlgorithmVariant>& getAlgorithmProperty(jsg::Lock& js);
+  jsg::MemoizedIdentity<kj::Array<kj::StringPtr>>& getUsagesProperty(jsg::Lock& js);
+
   JSG_RESOURCE_TYPE(CryptoKey) {
     JSG_READONLY_INSTANCE_PROPERTY(type, getType);
     JSG_READONLY_INSTANCE_PROPERTY(extractable, getExtractable);
-    JSG_READONLY_INSTANCE_PROPERTY(algorithm, getAlgorithm);
-    JSG_READONLY_INSTANCE_PROPERTY(usages, getUsages);
+    JSG_READONLY_INSTANCE_PROPERTY(algorithm, getAlgorithmProperty);
+    JSG_READONLY_INSTANCE_PROPERTY(usages, getUsagesProperty);
   }
 
   // HACK: Needs to be public so derived classes can inherit from it.
@@ -329,6 +336,8 @@ class CryptoKey: public jsg::Object {
 
  private:
   kj::Own<Impl> impl;
+  kj::Maybe<jsg::MemoizedIdentity<AlgorithmVariant>> algorithmProperty;
+  kj::Maybe<jsg::MemoizedIdentity<kj::Array<kj::StringPtr>>> usagesProperty;
 
   void visitForGc(jsg::GcVisitor& visitor);
 

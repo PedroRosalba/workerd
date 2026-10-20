@@ -1,7 +1,7 @@
 // Copyright (c) 2023 Cloudflare, Inc.
 // Licensed under the Apache 2.0 license found in the LICENSE file or at:
 //     https://opensource.org/licenses/Apache-2.0
-import { rejects, strictEqual, ok } from 'node:assert';
+import { notStrictEqual, rejects, strictEqual, ok } from 'node:assert';
 
 export const timingSafeEqual = {
   test() {
@@ -509,5 +509,24 @@ export const webCryptoSignAlgorithmIgnoresUnrelatedContext = {
         true
       );
     }
+  },
+};
+
+// Without pedantic_wpt, CryptoKey's algorithm and usages getters return a new object on every
+// access. WPT's crypto_key_cached_slots test covers the cached behavior under pedantic_wpt.
+export const cryptoKeyAttributesNotCachedWithoutPedanticWpt = {
+  async test() {
+    const key = await crypto.subtle.generateKey(
+      { name: 'HMAC', hash: 'SHA-256' },
+      true,
+      ['sign', 'verify']
+    );
+    notStrictEqual(key.algorithm, key.algorithm);
+    notStrictEqual(key.usages, key.usages);
+
+    key.algorithm.name = 'modified';
+    key.usages.push('modified');
+    strictEqual(key.algorithm.name, 'HMAC');
+    strictEqual(key.usages.length, 2);
   },
 };
